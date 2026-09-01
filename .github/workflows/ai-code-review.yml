@@ -1,0 +1,177 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  ai-code-review:
+
+    runs-on: self-hosted
+
+    steps:
+
+      # ==========================================
+      # Checkout
+      # ==========================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ==========================================
+      # Python
+      # ==========================================
+
+      - name: Check Python
+        run: |
+          python3 --version
+
+      # ==========================================
+      # Install dependencies
+      # ==========================================
+
+      - name: Install dependencies
+        run: |
+          python3 -m venv .venv
+
+          .venv/bin/python \
+            -m pip install --upgrade pip
+
+          .venv/bin/python \
+            -m pip install anthropic
+
+      # ==========================================
+      # Generate PR diff
+      # ==========================================
+
+      - name: Generate PR diff
+        run: |
+
+          echo "Fetching base branch..."
+
+          git fetch origin \
+            "${{ github.event.pull_request.base.ref }}"
+
+          echo "Generating PR diff..."
+
+          git diff \
+            "origin/${{ github.event.pull_request.base.ref }}...HEAD" \
+            > pr_diff.txt
+
+          echo "Diff generated"
+
+          echo "Diff lines:"
+          wc -l pr_diff.txt
+
+          echo "Changed files:"
+
+          git diff \
+            --name-only \
+            "origin/${{ github.event.pull_request.base.ref }}...HEAD"
+
+      # ==========================================
+      # Validate Claude configuration
+      # ==========================================
+
+      - name: Validate Claude configuration
+        env:
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+
+        run: |
+
+          echo "Validating Claude configuration..."
+
+          if [ -z "$ANTHROPIC_AUTH_TOKEN" ]; then
+            echo "ERROR: ANTHROPIC_AUTH_TOKEN is not configured"
+            exit 1
+          fi
+
+          if [ -z "$ANTHROPIC_BASE_URL" ]; then
+            echo "ERROR: ANTHROPIC_BASE_URL is not configured"
+            exit 1
+          fi
+
+          if [ -z "$ANTHROPIC_MODEL" ]; then
+            echo "ERROR: ANTHROPIC_MODEL is not configured"
+            exit 1
+          fi
+
+          echo "Claude authentication: configured"
+          echo "Claude base URL: $ANTHROPIC_BASE_URL"
+          echo "Claude model: $ANTHROPIC_MODEL"
+
+      # ==========================================
+      # Claude AI Code Review
+      # ==========================================
+
+      - name: Claude AI Code Review
+        env:
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+
+        run: |
+
+          echo "======================================"
+          echo "Starting Claude AI Code Review"
+          echo "======================================"
+
+          .venv/bin/python \
+            scripts/claude_api.py \
+            --diff pr_diff.txt
+
+      # ==========================================
+      # Validate result
+      # ==========================================
+
+      - name: Validate review result
+        run: |
+
+          echo "Validating review result..."
+
+          if [ ! -f review_result.json ]; then
+            echo "ERROR: review_result.json was not generated"
+            exit 1
+          fi
+
+          if [ ! -s review_result.json ]; then
+            echo "ERROR: review_result.json is empty"
+            exit 1
+          fi
+
+          .venv/bin/python \
+            -m json.tool \
+            review_result.json \
+            > /dev/null
+
+          echo "Review result is valid"
+
+      # ==========================================
+      # Publish review
+      # ==========================================
+
+      - name: Publish AI review to GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        run: |
+
+          echo "Publishing AI review to GitHub..."
+
+          .venv/bin/python \
+            scripts/publish_review.py \
+            --review-file review_result.json \
+            --pr-number "${{ github.event.pull_request.number }}"
+
+          echo "AI review published successfully"
