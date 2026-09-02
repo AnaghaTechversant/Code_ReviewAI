@@ -12,59 +12,131 @@ permissions:
   pull-requests: write
 
 jobs:
+
   ai-code-review:
 
     runs-on: self-hosted
 
     steps:
 
-      # ==========================================
-      # Checkout
-      # ==========================================
-
+      # ------------------------------------------------
+      # 1. Checkout repository
+      # ------------------------------------------------
+      
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
 
-      # ==========================================
-      # Python
-      # ==========================================
-
-      - name: Check Python
+      - name: Debug checkout
         run: |
+          echo "======================================"
+          echo "WORKSPACE"
+          echo "======================================"
+
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          echo "PWD=$(pwd)"
+
+          echo "======================================"
+          echo "PR INFORMATION"
+          echo "======================================"
+
+          echo "PR HEAD SHA:"
+          echo "${{ github.event.pull_request.head.sha }}"
+
+          echo "PR HEAD BRANCH:"
+          echo "${{ github.event.pull_request.head.ref }}"
+
+          echo "======================================"
+          echo "CHECKED OUT COMMIT"
+          echo "======================================"
+
+          git rev-parse HEAD
+
+          echo "======================================"
+          echo "CLAUDE FILE"
+          echo "======================================"
+
+          if [ -f "$GITHUB_WORKSPACE/scripts/claude_api.py" ]; then
+            echo "claude_api.py FOUND"
+            ls -lh "$GITHUB_WORKSPACE/scripts/claude_api.py"
+          else
+            echo "ERROR: claude_api.py NOT FOUND"
+            echo "Searching:"
+            find "$GITHUB_WORKSPACE" \
+              -name "claude_api.py" \
+              -print
+
+            echo "Tracked review scripts:"
+            git ls-files | grep -E 'scripts/.*(claude|ai_code_review)' || true
+
+            exit 1
+          fi
+      # ------------------------------------------------
+      # 2. Get PR information
+      # ------------------------------------------------
+      - name: Get PR information
+        id: pr_info
+        run: |
+          echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> "$GITHUB_ENV"
+          echo "BASE_BRANCH=${{ github.event.pull_request.base.ref }}" >> "$GITHUB_ENV"
+          echo "HEAD_BRANCH=${{ github.event.pull_request.head.ref }}" >> "$GITHUB_ENV"
+
+          echo "PR Number: ${{ github.event.pull_request.number }}"
+          echo "Base Branch: ${{ github.event.pull_request.base.ref }}"
+          echo "Head Branch: ${{ github.event.pull_request.head.ref }}"
+
+      # ------------------------------------------------
+      # 3. Setup Python virtual environment
+      # ------------------------------------------------
+      - name: Setup Python virtual environment
+        id: setup_python
+        run: |
+
+          echo "Python version:"
           python3 --version
 
-      # ==========================================
-      # Install dependencies
-      # ==========================================
+          echo "Creating virtual environment..."
 
-      - name: Install dependencies
-        run: |
+          rm -rf .venv
+
           python3 -m venv .venv
 
-          .venv/bin/python \
-            -m pip install --upgrade pip
+          .venv/bin/python --version
 
-          .venv/bin/python \
-            -m pip install anthropic
+          echo "Upgrading pip..."
 
-      # ==========================================
-      # Generate PR diff
-      # ==========================================
+          .venv/bin/python -m pip install --upgrade pip
 
+      # ------------------------------------------------
+      # 4. Install Python dependencies
+      # ------------------------------------------------
+      - name: Install dependencies
+        id: install_dependencies
+        run: |
+
+          echo "Installing dependencies..."
+
+          .venv/bin/python -m pip install -r requirements.txt
+
+          echo "Dependencies installed successfully"
+
+      # ------------------------------------------------
+      # 5. Generate PR diff
+      # ------------------------------------------------
       - name: Generate PR diff
+        id: generate_diff
         run: |
 
           echo "Fetching base branch..."
 
-          git fetch origin \
-            "${{ github.event.pull_request.base.ref }}"
+          git fetch origin "$BASE_BRANCH"
 
           echo "Generating PR diff..."
 
           git diff \
-            "origin/${{ github.event.pull_request.base.ref }}...HEAD" \
+            "origin/$BASE_BRANCH...HEAD" \
             > pr_diff.txt
 
           echo "Diff generated"
@@ -73,15 +145,17 @@ jobs:
           wc -l pr_diff.txt
 
           echo "Changed files:"
-
           git diff \
             --name-only \
-            "origin/${{ github.event.pull_request.base.ref }}...HEAD"
+            "origin/$BASE_BRANCH...HEAD"
 
-      # ==========================================
-      # Validate Claude configuration
-      # ==========================================
+          if [ ! -s pr_diff.txt ]; then
+            echo "WARNING: PR diff is empty"
+          fi
 
+      # ------------------------------------------------
+      # 6. Validate Claude API configuration
+      # ------------------------------------------------
       - name: Validate Claude configuration
         env:
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
@@ -110,16 +184,20 @@ jobs:
           echo "Claude authentication: configured"
           echo "Claude base URL: $ANTHROPIC_BASE_URL"
           echo "Claude model: $ANTHROPIC_MODEL"
-
-      # ==========================================
-      # Claude AI Code Review
-      # ==========================================
-
+       
+        
+      # ------------------------------------------------
+      # 7. Claude AI Code Review
+      # ------------------------------------------------
       - name: Claude AI Code Review
+        id: claude_review
+
         env:
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
           ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
           ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
 
         run: |
 
@@ -127,41 +205,45 @@ jobs:
           echo "Starting Claude AI Code Review"
           echo "======================================"
 
-          .venv/bin/python \
-            scripts/claude_api.py \
-            --diff pr_diff.txt
-
-      # ==========================================
-      # Validate result
-      # ==========================================
-
-      - name: Validate review result
-        run: |
-
-          echo "Validating review result..."
-
-          if [ ! -f review_result.json ]; then
-            echo "ERROR: review_result.json was not generated"
+          if [ -z "$ANTHROPIC_AUTH_TOKEN" ]; then
+            echo "ERROR: ANTHROPIC_AUTH_TOKEN is empty"
             exit 1
           fi
+
+          echo "Claude authentication: configured"
+          echo "Claude base URL: $ANTHROPIC_BASE_URL"
+          echo "Claude model: $ANTHROPIC_MODEL"
+
+          .venv/bin/python \
+            "$GITHUB_WORKSPACE/scripts/claude_api.py" \
+            --diff "$GITHUB_WORKSPACE/pr_diff.txt" \
+            --pr-number "$PR_NUMBER" \
+            --repository "$REPOSITORY"
+
+      # ------------------------------------------------
+      # 8. Validate Review Result
+      # ------------------------------------------------
+      - name: Validate review result
+        id: validate_review
+        run: |
+
+          echo "Validating review_result.json..."
 
           if [ ! -s review_result.json ]; then
             echo "ERROR: review_result.json is empty"
             exit 1
           fi
 
-          .venv/bin/python \
-            -m json.tool \
-            review_result.json \
-            > /dev/null
+          .venv/bin/python -m json.tool review_result.json > /dev/null
 
-          echo "Review result is valid"
+          echo "Review JSON is valid"
 
-      # ==========================================
-      # Publish review
-      # ==========================================
+      # ------------------------------------------------
+      # 9. Publish review to GitHub PR
+      # ------------------------------------------------
+      - name: Publish AI Review
+        id: publish_review
 
-      - name: Publish AI review to GitHub
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -170,8 +252,58 @@ jobs:
           echo "Publishing AI review to GitHub..."
 
           .venv/bin/python \
-            scripts/publish_review.py \
-            --review-file review_result.json \
-            --pr-number "${{ github.event.pull_request.number }}"
+            "$GITHUB_WORKSPACE/scripts/publish_review.py" \
+            --pr-number "$PR_NUMBER" \
+            --review-file review_result.json
 
-          echo "AI review published successfully"
+          echo "Review published successfully"
+
+      # ------------------------------------------------
+      # 10. Send reviewer notification
+      # ------------------------------------------------
+      - name: Send reviewer notification
+        id: reviewer_notification
+
+        env:
+          SMTP_HOST: ${{ vars.SMTP_HOST }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          REVIEWER_EMAIL: ${{ vars.REVIEWER_EMAIL }}
+
+        run: |
+
+          echo "Sending reviewer notification..."
+
+          .venv/bin/python \
+            "$GITHUB_WORKSPACE/scripts/send_review_email.py" \
+            --review-file review_result.json \
+            --pr-number "$PR_NUMBER" \
+            --repository "${{ github.repository }}"
+
+          echo "Reviewer notification sent"
+
+      # ------------------------------------------------
+      # 11. Auto merge
+      # ------------------------------------------------
+      # DISABLED FOR POC
+      #
+      # Enable only after:
+      # - Claude review validated
+      # - Human approval implemented
+      # - CI tests implemented
+      # - Security checks implemented
+      #
+      # - name: Auto merge approved PR
+      #   id: auto_merge
+      #   if: success()
+      #
+      #   env:
+      #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #
+      #   run: |
+      #
+      #     .venv/bin/python \
+      #       scripts/merge_if_approved.py \
+      #       --review-file review_result.json \
+      #       --pr-number "$PR_NUMBER"
