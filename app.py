@@ -21,6 +21,8 @@ def get_discount(user):
 
     return 0
 
+def additional_function():
+    print("This is an additional function that can be used for future enhancements.")
 
 def main():
     user = create_user(
