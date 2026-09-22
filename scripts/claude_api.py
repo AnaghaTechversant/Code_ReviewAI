@@ -1,282 +1,235 @@
 import os
 import json
-import argparse
+import os
+import json
+import logging
+from pathlib import Path
 
-from dotenv import load_dotenv
-from anthropic import Anthropic
+import anthropic
 
-
-# Load local .env file when running locally
-load_dotenv()
-
-
-MODEL = "claude-sonnet-5"
-ANTHROPIC_AUTH_TOKEN  = os.getenv("ANTHROPIC_AUTH_TOKEN")
+logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# Claude configuration
+# ============================================================
 
-if not ANTHROPIC_AUTH_TOKEN:
+MODEL = (
+    os.getenv("ANTHROPIC_MODEL", "").strip()
+    or os.getenv("CLAUDE_MODEL", "").strip()
+    or "claude-sonnet-4-20250514"
+)
+
+api_key = (
+    os.getenv("ANTHROPIC_AUTH_TOKEN", "").strip()
+    or os.getenv("ANTHROPIC_API_KEY", "").strip()
+    or os.getenv("ANTHROPIC_TOKEN", "").strip()
+)
+
+base_url = (
+    os.getenv("ANTHROPIC_BASE_URL", "").strip()
+    or "https://api.anthropic.com"
+)
+
+
+# ============================================================
+# Validate configuration
+# ============================================================
+
+if not api_key:
     raise RuntimeError(
-        "ANTHROPIC_AUTH_TOKEN  environment variable is not configured."
+        "ANTHROPIC_AUTH_TOKEN is not set. "
+        "Configure it in GitHub Actions secrets."
     )
 
+if not base_url.startswith(("http://", "https://")):
+    raise RuntimeError(
+        f"Invalid ANTHROPIC_BASE_URL: {base_url!r}"
+    )
 
 if not MODEL:
     raise RuntimeError(
-        "CLAUDE_MODEL environment variable is not configured."
+        "Claude model is not configured."
     )
 
 
-client = Anthropic(
-    api_key=ANTHROPIC_AUTH_TOKEN 
+logger.info(
+    "Claude configuration: model=%s base_url=%s",
+    MODEL,
+    base_url,
 )
+
+
+# ============================================================
+# Claude client
+# ============================================================
+
+client = anthropic.Anthropic(
+    api_key=api_key,
+    base_url=base_url.rstrip("/"),
+)
+
+# # Build client kwargs conditionally to avoid
+# # passing empty values to newer SDK versions.
+# client_kwargs: dict[str, Any] = {}
+
+# if api_key:
+#     client_kwargs["api_key"] = api_key
+
+# if base_url:
+#     client_kwargs["base_url"] = base_url.rstrip("/")
+
+# client = anthropic.Anthropic(**client_kwargs)
+
+
+def load_skill(skill_name: str) -> str:
+    project_root = Path(__file__).resolve().parent.parent
+
+    skill_file = (
+        project_root
+        / "skills"
+        / skill_name
+        / "skills.md"
+    )
+
+    if not skill_file.exists():
+        raise FileNotFoundError(
+            f"Skill not found: {skill_file}"
+        )
+
+    return skill_file.read_text(
+        encoding="utf-8"
+    )
 
 
 def review_code(
     diff: str,
     repository: str,
-    pr_number: int
+    pr_number: int,
+    selected_skills: list[str] | None = None,
+    review_mode: str = "PR",
+    repository_context: str = "",
+    **kwargs,
 ):
+    # Load ONLY the skills selected by the user
+    skills_content = []
+
+    # Support both 'selected_skills' and 'skills' param names
+    if selected_skills is None:
+        selected_skills = kwargs.get("skills") or []
+
+    selected_skills = selected_skills or []
+
+    for skill_name in selected_skills:
+        skill_name = skill_name.strip()
+
+        if not skill_name:
+            continue
+
+        skill = load_skill(skill_name)
+
+        skills_content.append(
+            f"""
+==============================
+SKILL: {skill_name}
+==============================
+{skill}
+"""
+        )
+
+    # If no skill was selected, use code-review as default
+    if not skills_content:
+        skills_content.append(
+            f"""
+==============================
+SKILL: code-review
+==============================
+{load_skill("code-review")}
+"""
+        )
+
+    combined_skills = "\n".join(skills_content)
 
     prompt = f"""
-You are an expert senior software engineer performing
-a Pull Request code review.
+You must perform this task using the following selected skills.
 
+{combined_skills}
+
+==============================
+REVIEW CONTEXT
+==============================
 Repository:
 {repository}
+
+Review Mode:
+{review_mode}
 
 Pull Request:
 #{pr_number}
 
-Review the following Git diff.
+Repository Context:
+{repository_context}
 
-Your objectives:
-
-1. Identify correctness issues.
-2. Identify security vulnerabilities.
-3. Identify performance problems.
-4. Identify maintainability issues.
-5. Identify error-handling problems.
-6. Identify missing or inadequate tests.
-7. Identify potential breaking changes.
-8. Do not report purely stylistic issues unless they
-   materially affect maintainability.
-9. Do not invent files, functions, requirements, or
-   business rules.
-10. Only report findings supported by the supplied code.
-
-For every finding provide:
-
-- file
-- line
-- severity
-- category
-- issue
-- explanation
-- suggested_fix
-
-Severity must be one of:
-
-CRITICAL
-HIGH
-MEDIUM
-LOW
-
-Return ONLY valid JSON.
-
-Expected structure:
-
-{{
-  "status": "APPROVED" or "CHANGES_REQUESTED",
-  "summary": "Short review summary",
-  "score": 0,
-  "findings": [
-    {{
-      "file": "path/to/file.py",
-      "line": 10,
-      "severity": "HIGH",
-      "category": "SECURITY",
-      "issue": "Description of the issue",
-      "explanation": "Why this is a problem",
-      "suggested_fix": "Recommended fix"
-    }}
-  ]
-}}
-
-If there are no significant findings, return:
-
-{{
-  "status": "APPROVED",
-  "summary": "No significant issues found.",
-  "score": 10,
-  "findings": []
-}}
-
-Git diff:
-
+==============================
+CODE / DIFF
+==============================
 {diff}
+
+==============================
+INSTRUCTIONS
+==============================
+Follow all selected skill instructions exactly.
+
+Return ONLY the JSON format specified
+by the applicable skill instructions.
 """
 
     print(f"Calling Claude model: {MODEL}")
 
-    # response = client.messages.create(
-    #     model=MODEL,
-    #     max_tokens=4096,
-    #     messages=[
-    #         {
-    #             "role": "user",
-    #             "content": prompt
-    #         }
-    #     ]
-    # )
     response = client.messages.create(
-    model=MODEL,
-    max_tokens=8192,
-    thinking={
-        "type": "disabled"
-    },
-    messages=[
-        {
-            "role": "user",
-            "content": prompt
-        }
-    ]
-)
-    if response.stop_reason == "max_tokens":
-        raise RuntimeError(
-            "Claude response was truncated (hit max_tokens limit). "
-            "Increase max_tokens or reduce diff size."
-        )
-    # text = response.content[0].text.strip()
-    text = ""
+        model=MODEL,
+        max_tokens=4096,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+    )
+
+    text_parts = []
 
     for block in response.content:
         if getattr(block, "type", None) == "text":
-            text += block.text
+            text_parts.append(block.text)
 
-    text = text.strip()
+    text = "\n".join(text_parts).strip()
 
     if not text:
         raise RuntimeError(
             "Claude returned no text content. "
-            f"Response content types: "
+            f"Response blocks: "
             f"{[getattr(b, 'type', type(b).__name__) for b in response.content]}"
         )
 
-    # Remove Markdown code fences if Claude returns them
+    # Remove Markdown JSON fences if Claude returns them
+    if text.startswith("```json"):
+        text = text[len("```json"):].strip()
+
     if text.startswith("```"):
-        text = text.replace("```json", "")
-        text = text.replace("```", "")
-        text = text.strip()
+        text = text[3:].strip()
+
+    if text.endswith("```"):
+        text = text[:-3].strip()
 
     try:
         review = json.loads(text)
     except json.JSONDecodeError as exc:
         print("Claude returned invalid JSON:")
-        print(text)
+        print(text[:5000])
 
         raise RuntimeError(
             "Claude response was not valid JSON."
         ) from exc
 
     return review
-
-
-def main():
-
-    parser = argparse.ArgumentParser(
-        description="Claude AI Pull Request Code Review"
-    )
-
-    parser.add_argument(
-        "--diff",
-        required=True,
-        help="Path to PR diff file"
-    )
-
-    parser.add_argument(
-        "--pr-number",
-        required=True,
-        type=int,
-        help="GitHub Pull Request number"
-    )
-
-    parser.add_argument(
-        "--repository",
-        required=True,
-        help="GitHub repository name"
-    )
-
-    args = parser.parse_args()
-
-    # ---------------------------------------------
-    # Read diff
-    # ---------------------------------------------
-
-    with open(
-        args.diff,
-        "r",
-        encoding="utf-8"
-    ) as f:
-
-        diff = f.read()
-
-    # ---------------------------------------------
-    # Handle empty diff
-    # ---------------------------------------------
-
-    if not diff.strip():
-
-        print("WARNING: PR diff is empty.")
-
-        review = {
-            "status": "APPROVED",
-            "summary": "No code changes detected.",
-            "score": 10,
-            "findings": []
-        }
-
-    else:
-
-        review = review_code(
-            diff=diff,
-            repository=args.repository,
-            pr_number=args.pr_number
-        )
-
-    # ---------------------------------------------
-    # Save result
-    # ---------------------------------------------
-
-    output_file = "review_result.json"
-
-    with open(
-        output_file,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            review,
-            f,
-            indent=2
-        )
-
-    print()
-    print("======================================")
-    print("CLAUDE AI CODE REVIEW RESULT")
-    print("======================================")
-
-    print(
-        json.dumps(
-            review,
-            indent=2
-        )
-    )
-
-    print()
-    print(f"Review saved to: {output_file}")
-
-
-if __name__ == "__main__":
-    main()
