@@ -11,7 +11,9 @@ def create_user(name, email, age):
 
     return user
 
-
+def get_user_info(user):
+    return user.get_info()
+    
 def get_discount(user):
     if user.age > 60:
         return 20
@@ -21,6 +23,8 @@ def get_discount(user):
 
     return 0
 
+def additional_function():
+    print("This is an additional function that can be used for future enhancements.")
 
 def main():
     user = create_user(
